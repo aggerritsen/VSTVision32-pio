@@ -1,30 +1,24 @@
 #include "sdcard.h"
-#include "SD_MMC.h"
+#include <SD_MMC.h>
 
-/*
- * T-SIM7080G-S3 SD card wiring (SDMMC 1-bit)
- * CLK = GPIO38
- * CMD = GPIO39
- * D0  = GPIO40
- */
+/* =============================
+   SD PIN CONFIG (T-SIM7080G-S3)
+   ============================= */
+#define SD_CMD  39
+#define SD_CLK  38
+#define SD_DATA 40
 
 static bool sd_ok = false;
 
+/* =============================
+   INIT
+   ============================= */
 bool sdcard_init()
 {
-    if (sd_ok)
-        return true;
-
     Serial.println("📀 Initializing SD card (SD_MMC, custom pins)...");
 
-    // Explicit SDMMC pin mapping for T-SIM7080G-S3
-    SD_MMC.setPins(
-        GPIO_NUM_38,  // CLK
-        GPIO_NUM_39,  // CMD
-        GPIO_NUM_40   // D0
-    );
+    SD_MMC.setPins(SD_CLK, SD_CMD, SD_DATA);
 
-    // true = 1-bit mode (required for this board)
     if (!SD_MMC.begin("/sdcard", true))
     {
         Serial.println("❌ SD_MMC mount failed");
@@ -32,43 +26,49 @@ bool sdcard_init()
         return false;
     }
 
-    uint8_t cardType = SD_MMC.cardType();
-    if (cardType == CARD_NONE)
-    {
-        Serial.println("❌ No SD card detected");
-        sd_ok = false;
-        return false;
-    }
+    uint64_t size = SD_MMC.cardSize();
+    uint64_t used = SD_MMC.usedBytes();
 
-    Serial.print("✅ SD card mounted: ");
-    switch (cardType)
-    {
-        case CARD_MMC:  Serial.println("MMC"); break;
-        case CARD_SD:   Serial.println("SDSC"); break;
-        case CARD_SDHC: Serial.println("SDHC/SDXC"); break;
-        default:        Serial.println("UNKNOWN"); break;
-    }
-
-    Serial.printf(
-        "📦 SD size: %llu MB\n",
-        SD_MMC.cardSize() / (1024ULL * 1024ULL)
-    );
+    Serial.printf("✅ SD card mounted\n");
+    Serial.printf("📦 SD size : %llu MB\n", size / (1024 * 1024));
+    Serial.printf("📊 SD usage: %llu / %llu bytes\n", used, size);
 
     sd_ok = true;
     return true;
 }
 
-bool sdcard_ready()
+bool sdcard_available()
 {
     return sd_ok;
 }
 
-uint64_t sdcard_total_bytes()
+/* =============================
+   SAVE JPEG
+   ============================= */
+bool sdcard_save_jpeg(uint32_t frame_id, const uint8_t *data, size_t len)
 {
-    return sd_ok ? SD_MMC.totalBytes() : 0;
-}
+    if (!sd_ok)
+        return false;
 
-uint64_t sdcard_used_bytes()
-{
-    return sd_ok ? SD_MMC.usedBytes() : 0;
+    char path[32];
+    snprintf(path, sizeof(path), "/frame_%06lu.jpg", frame_id);
+
+    File f = SD_MMC.open(path, FILE_WRITE);
+    if (!f)
+    {
+        Serial.printf("❌ Failed to open %s\n", path);
+        return false;
+    }
+
+    size_t written = f.write(data, len);
+    f.close();
+
+    if (written != len)
+    {
+        Serial.printf("❌ SD write incomplete (%u / %u)\n", written, len);
+        return false;
+    }
+
+    Serial.printf("💾 JPEG saved: %s (%u bytes)\n", path, len);
+    return true;
 }

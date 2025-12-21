@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include "driver/uart.h"
 #include "esp_crc.h"
+#include "mbedtls/base64.h"
 #include "sdcard.h"
+
 
 /* =============================
    UART CONFIG
@@ -27,9 +29,8 @@ static RxState rx_state = WAIT_JSON;
 /* =============================
    FRAME DATA
    ============================= */
-static String json_buffer;
-static String image_base64;
-
+static String   json_buffer;
+static String   image_base64;
 static size_t   image_expected_len = 0;
 static uint32_t image_expected_crc = 0;
 static uint32_t frame_id = 0;
@@ -46,6 +47,155 @@ void reset_frame()
     rx_state = WAIT_JSON;
 }
 
+bool jpeg_sanity_check(const uint8_t *buf, size_t len)
+{
+    if (len < 4)
+        return false;
+
+    // SOI
+    if (buf[0] != 0xFF || buf[1] != 0xD8)
+    {
+        Serial.println("❌ JPEG sanity: missing SOI");
+        return false;
+    }
+
+    bool found_sos = false;
+    bool found_eoi = false;
+
+    size_t i = 2;
+
+    while (i + 1 < len)
+    {
+        if (buf[i] != 0xFF)
+        {
+            i++;
+            continue;
+        }
+
+        uint8_t marker = buf[i + 1];
+
+        // Stuffed byte (FF 00)
+        if (marker == 0x00)
+        {
+            i += 2;
+            continue;
+        }
+
+        // EOI
+        if (marker == 0xD9)
+        {
+            found_eoi = true;
+            break;
+        }
+
+        // SOS (start of scan)
+        if (marker == 0xDA)
+        {
+            found_sos = true;
+            i += 2;
+
+            // Scan entropy data until EOI
+            while (i + 1 < len)
+            {
+                if (buf[i] == 0xFF && buf[i + 1] == 0xD9)
+                {
+                    found_eoi = true;
+                    break;
+                }
+                i++;
+            }
+            break;
+        }
+
+        // Markers with length field
+        if (i + 3 >= len)
+        {
+            Serial.println("❌ JPEG sanity: truncated marker");
+            return false;
+        }
+
+        uint16_t seg_len = (buf[i + 2] << 8) | buf[i + 3];
+        if (seg_len < 2)
+        {
+            Serial.println("❌ JPEG sanity: invalid segment length");
+            return false;
+        }
+
+        i += 2 + seg_len;
+    }
+
+    if (!found_sos)
+    {
+        Serial.println("❌ JPEG sanity: missing SOS");
+        return false;
+    }
+
+    if (!found_eoi)
+    {
+        Serial.println("❌ JPEG sanity: missing EOI");
+        return false;
+    }
+
+    Serial.println("✅ JPEG sanity: marker structure OK");
+    return true;
+}
+
+
+/* =============================
+   BASE64 → JPEG DECODE
+   ============================= */
+bool decode_base64_to_jpeg(
+    const String &b64,
+    uint8_t **out_buf,
+    size_t *out_len
+)
+{
+    size_t decoded_len = 0;
+
+    int rc = mbedtls_base64_decode(
+        nullptr,
+        0,
+        &decoded_len,
+        (const unsigned char *)b64.c_str(),
+        b64.length()
+    );
+
+    if (rc != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL)
+    {
+        Serial.printf("❌ Base64 size calc failed (%d)\n", rc);
+        return false;
+    }
+
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(
+        decoded_len,
+        MALLOC_CAP_8BIT
+    );
+
+    if (!buf)
+    {
+        Serial.println("❌ JPEG buffer alloc failed");
+        return false;
+    }
+
+    rc = mbedtls_base64_decode(
+        buf,
+        decoded_len,
+        out_len,
+        (const unsigned char *)b64.c_str(),
+        b64.length()
+    );
+
+    if (rc != 0)
+    {
+        Serial.printf("❌ Base64 decode failed (%d)\n", rc);
+        free(buf);
+        return false;
+    }
+
+    *out_buf = buf;
+    return true;
+}
+
 /* =============================
    SETUP
    ============================= */
@@ -58,13 +208,12 @@ void setup()
     Serial.println(" T-SIM7080G-S3 | SSCMA UART RECEIVER ");
     Serial.println("=======================================");
 
-    /* ---------- UART (IDF DRIVER) ---------- */
     uart_config_t cfg = {
-        .baud_rate  = UART_BAUD,
-        .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE,
-        .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .baud_rate = UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_APB,
     };
 
@@ -79,20 +228,9 @@ void setup()
     );
 
     Serial.println("UART1 configured (IDF driver)");
+    
+    sdcard_init();
 
-    /* ---------- SD CARD (ABSTRACTION ONLY) ---------- */
-    if (!sdcard_init())
-    {
-        Serial.println("⚠ SD card not available — continuing without storage");
-    }
-    else
-    {
-        Serial.printf(
-            "📊 SD usage: %llu / %llu bytes\n",
-            sdcard_used_bytes(),
-            sdcard_total_bytes()
-        );
-    }
 }
 
 /* =============================
@@ -120,10 +258,7 @@ void loop()
 
         if (image_base64.length() >= image_expected_len)
         {
-            Serial.printf(
-                "🖼 Image received (%u bytes)\n",
-                image_base64.length()
-            );
+            Serial.printf("🖼 Image received (%u bytes)\n", image_base64.length());
             rx_state = WAIT_END;
         }
         return;
@@ -179,13 +314,39 @@ void loop()
 
             if (crc == image_expected_crc)
             {
-                Serial.println("✅ CRC OK → ACK sent");
+                Serial.println("✅ CRC OK");
+
+                uint8_t *jpeg_buf = nullptr;
+                size_t jpeg_len = 0;
+
+                if (decode_base64_to_jpeg(image_base64, &jpeg_buf, &jpeg_len))
+                {
+                    Serial.printf("🧩 JPEG decoded: %u bytes\n", jpeg_len);
+
+                    if (jpeg_len >= 3)
+                    {
+                        Serial.printf(
+                            "🧪 JPEG magic: %02X %02X %02X\n",
+                            jpeg_buf[0],
+                            jpeg_buf[1],
+                            jpeg_buf[2]
+                        );
+                    }
+
+                    jpeg_sanity_check(jpeg_buf, jpeg_len);
+                    
+                    if (sdcard_available())
+                        sdcard_save_jpeg(frame_id, jpeg_buf, jpeg_len);
+
+                    free(jpeg_buf);
+                }
+
                 String ack = "ACK " + String(frame_id) + "\n";
                 uart_write_bytes(UART_PORT, ack.c_str(), ack.length());
             }
             else
             {
-                Serial.println("❌ CRC FAIL → NACK sent");
+                Serial.println("❌ CRC FAIL");
                 String nack = "NACK " + String(frame_id) + "\n";
                 uart_write_bytes(UART_PORT, nack.c_str(), nack.length());
             }

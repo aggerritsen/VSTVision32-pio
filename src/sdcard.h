@@ -1,7 +1,6 @@
 #pragma once
 #include <Arduino.h>
 
-bool     sdcard_init();
-bool     sdcard_ready();
-uint64_t sdcard_total_bytes();
-uint64_t sdcard_used_bytes();
+bool sdcard_init();
+bool sdcard_available();
+bool sdcard_save_jpeg(uint32_t frame_id, const uint8_t *data, size_t len);
