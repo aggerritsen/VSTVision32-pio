@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "driver/uart.h"
 #include "esp_crc.h"
+#include "sdcard.h"
 
 /* =============================
    UART CONFIG
@@ -57,12 +58,13 @@ void setup()
     Serial.println(" T-SIM7080G-S3 | SSCMA UART RECEIVER ");
     Serial.println("=======================================");
 
+    /* ---------- UART (IDF DRIVER) ---------- */
     uart_config_t cfg = {
-        .baud_rate = UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .baud_rate  = UART_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_APB,
     };
 
@@ -77,6 +79,20 @@ void setup()
     );
 
     Serial.println("UART1 configured (IDF driver)");
+
+    /* ---------- SD CARD (ABSTRACTION ONLY) ---------- */
+    if (!sdcard_init())
+    {
+        Serial.println("⚠ SD card not available — continuing without storage");
+    }
+    else
+    {
+        Serial.printf(
+            "📊 SD usage: %llu / %llu bytes\n",
+            sdcard_used_bytes(),
+            sdcard_total_bytes()
+        );
+    }
 }
 
 /* =============================
@@ -104,7 +120,10 @@ void loop()
 
         if (image_base64.length() >= image_expected_len)
         {
-            Serial.printf("🖼 Image received (%u bytes)\n", image_base64.length());
+            Serial.printf(
+                "🖼 Image received (%u bytes)\n",
+                image_base64.length()
+            );
             rx_state = WAIT_END;
         }
         return;
