@@ -29,6 +29,7 @@ static uint32_t last_send_ms = 0;
 
 /* Cached frame (for resend) */
 static String cached_json;
+static String cached_inf;          // ✅ NEW
 static String cached_image;
 static size_t cached_image_len = 0;
 static uint32_t cached_image_crc = 0;
@@ -51,9 +52,13 @@ void log_memory()
    ================================ */
 void send_cached_frame()
 {
-    /* JSON */
+    /* JSON (unchanged, backward compatible) */
     BrokerUART.print("JSON ");
     BrokerUART.println(cached_json);
+
+    /* INF (new, inference-only) */
+    BrokerUART.print("INF ");
+    BrokerUART.println(cached_inf);
 
     /* IMAGE */
     BrokerUART.print("IMAGE ");
@@ -86,40 +91,43 @@ bool prepare_frame()
 
     frame_id++;
 
-    /* Cache JSON */
-    cached_json = "";
-    cached_json += "{\"frame\":";
-    cached_json += frame_id;
-    cached_json += ",\"perf\":{";
-    cached_json += "\"preprocess\":";
-    cached_json += AI.perf().prepocess;
-    cached_json += ",\"inference\":";
-    cached_json += AI.perf().inference;
-    cached_json += ",\"postprocess\":";
-    cached_json += AI.perf().postprocess;
-    cached_json += "},\"boxes\":[";
+    /* ---------- Build inference JSON (NEW) ---------- */
+    cached_inf = "";
+    cached_inf += "{\"frame\":";
+    cached_inf += frame_id;
+    cached_inf += ",\"perf\":{";
+    cached_inf += "\"preprocess\":";
+    cached_inf += AI.perf().prepocess;
+    cached_inf += ",\"inference\":";
+    cached_inf += AI.perf().inference;
+    cached_inf += ",\"postprocess\":";
+    cached_inf += AI.perf().postprocess;
+    cached_inf += "},\"boxes\":[";
 
     for (size_t i = 0; i < AI.boxes().size(); i++)
     {
         auto &b = AI.boxes()[i];
-        if (i) cached_json += ",";
-        cached_json += "{\"target\":";
-        cached_json += b.target;
-        cached_json += ",\"score\":";
-        cached_json += b.score;
-        cached_json += ",\"x\":";
-        cached_json += b.x;
-        cached_json += ",\"y\":";
-        cached_json += b.y;
-        cached_json += ",\"w\":";
-        cached_json += b.w;
-        cached_json += ",\"h\":";
-        cached_json += b.h;
-        cached_json += "}";
+        if (i) cached_inf += ",";
+        cached_inf += "{\"target\":";
+        cached_inf += b.target;
+        cached_inf += ",\"score\":";
+        cached_inf += b.score;
+        cached_inf += ",\"x\":";
+        cached_inf += b.x;
+        cached_inf += ",\"y\":";
+        cached_inf += b.y;
+        cached_inf += ",\"w\":";
+        cached_inf += b.w;
+        cached_inf += ",\"h\":";
+        cached_inf += b.h;
+        cached_inf += "}";
     }
-    cached_json += "]}";
+    cached_inf += "]}";
 
-    /* Cache image */
+    /* ---------- Build legacy JSON (UNCHANGED) ---------- */
+    cached_json = cached_inf;  // identical content, preserved for compatibility
+
+    /* ---------- Cache image ---------- */
     cached_image = AI.last_image();
     cached_image_len = cached_image.length();
 
