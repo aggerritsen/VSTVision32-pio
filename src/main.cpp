@@ -3,6 +3,7 @@
 #include "esp_crc.h"
 #include "mbedtls/base64.h"
 #include "sdcard.h"
+#include "modem.h"
 
 
 /* =============================
@@ -208,6 +209,19 @@ void setup()
     Serial.println(" T-SIM7080G-S3 | SSCMA UART RECEIVER ");
     Serial.println("=======================================");
 
+    char ts[32];
+
+    if (!modem_init_early()) {
+        Serial.println("⚠ Modem init failed");
+    }
+
+    if (modem_get_timestamp(ts, sizeof(ts))) {
+        Serial.print("🕒 Timestamp: ");
+        Serial.println(ts);
+    }
+
+
+    // --- existing UART config (UNCHANGED) ---
     uart_config_t cfg = {
         .baud_rate = UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
@@ -228,9 +242,9 @@ void setup()
     );
 
     Serial.println("UART1 configured (IDF driver)");
-    
-    sdcard_init();
 
+    // --- SD init stays as-is ---
+    sdcard_init();
 }
 
 /* =============================

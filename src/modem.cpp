@@ -1,76 +1,178 @@
-#include <Arduino.h>
-#define TINY_GSM_MODEM_SIM7070
-#define TINY_GSM_RX_BUFFER 1024
-#include <TinyGsmClient.h>
 #include "modem.h"
 
-#define MODEM_TX    27
-#define MODEM_RX    26
-#define MODEM_PWR   4
-#define MODEM_BAUD  115200
+#define XPOWERS_CHIP_AXP2101
+#include <XPowersLib.h>
 
-#define SerialAT    Serial1
-TinyGsm modem(SerialAT);
+#define TINY_GSM_MODEM_SIM7080
+#include <TinyGsmClient.h>
 
-static void modemPowerOn()
+/* =============================
+   MODEM PINS (T-SIM7080G-S3)
+   ============================= */
+#define MODEM_RX_PIN   4
+#define MODEM_TX_PIN   5
+#define MODEM_PWR_PIN  41
+
+#define PMU_I2C_SDA    15
+#define PMU_I2C_SCL    7
+
+#define MODEM_BAUD     115200
+
+/* =============================
+   GLOBALS
+   ============================= */
+static HardwareSerial ModemSerial(1);
+static TinyGsm modem(ModemSerial);
+static XPowersPMU PMU;
+
+/* =============================
+   INTERNAL HELPERS
+   ============================= */
+static bool year_plausible(int year)
 {
-	pinMode(MODEM_PWR, OUTPUT);
-	digitalWrite(MODEM_PWR, HIGH);
-	delay(100); 
-	digitalWrite(MODEM_PWR, LOW);
-	delay(1000); 
-	digitalWrite(MODEM_PWR, HIGH);
-	delay(2000); 
+    return year >= 2022 && year <= 2099;
 }
 
-bool modemInit()
+static bool wait_for_network(uint32_t timeout_ms)
 {
-	modemPowerOn();
-	SerialAT.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
-	
-	uint32_t start = millis();
-	while (millis() - start < 10000) {
-		SerialAT.println("AT");
-		delay(500);
-		if (SerialAT.available()) {
-			if (SerialAT.readString().indexOf("OK") >= 0) goto found;
-		}
-	}
-	return false;
+    uint32_t start = millis();
 
-found:
-	if (!modem.init()) return false;
-	modem.sendAT("+CTZU=1");
-	modem.waitResponse();
-	return modem.waitForNetwork(30000L);
+    while (millis() - start < timeout_ms)
+    {
+        modem.sendAT("+CEREG?");
+        if (modem.waitResponse(2000, ",1") == 1 ||
+            modem.waitResponse(2000, ",5") == 1)
+            return true;
+
+        modem.sendAT("+CREG?");
+        if (modem.waitResponse(2000, ",1") == 1 ||
+            modem.waitResponse(2000, ",5") == 1)
+            return true;
+
+        delay(1000);
+    }
+
+    return false;
 }
 
-bool modemGetTimestamp(struct tm &out)
+/* =============================
+   PUBLIC API
+   ============================= */
+
+bool modem_init_early()
 {
-	while(SerialAT.available()) SerialAT.read();
-	modem.sendAT("+CCLK?");
-	if (modem.waitResponse(2000, "+CCLK: ") != 1) return false;
-	String res = SerialAT.readStringUntil('\n');
-	res.replace("\"", "");
-	res.trim();
-	if (res.length() < 17) return false;
-	
-	int yy = res.substring(0, 2).toInt();
-	int mm = res.substring(3, 5).toInt();
-	int dd = res.substring(6, 8).toInt();
-	int hh = res.substring(9, 11).toInt();
-	int min = res.substring(12, 14).toInt();
-	int sec = res.substring(15, 17).toInt();
-	
-	if (2000 + yy < 2024) return false;
-	
-	memset(&out, 0, sizeof(struct tm));
-	out.tm_year = (2000 + yy) - 1900;
-	out.tm_mon = mm - 1;
-	out.tm_mday = dd;
-	out.tm_hour = hh;
-	out.tm_min = min;
-	out.tm_sec = sec;
-	out.tm_isdst = -1;
-	return true;
+    Serial.println("📡 Modem early init (PMU + AT)");
+
+    Wire.begin(PMU_I2C_SDA, PMU_I2C_SCL);
+
+    if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, PMU_I2C_SDA, PMU_I2C_SCL))
+    {
+        Serial.println("❌ PMU init failed");
+        return false;
+    }
+
+    /* ---- Modem power rails ONLY ---- */
+    PMU.setDC3Voltage(3000);
+    PMU.enableDC3();
+
+    PMU.setBLDO2Voltage(3300);
+    PMU.enableBLDO2();
+
+    PMU.disableTSPinMeasure();
+
+    delay(100);
+
+    /* ---- UART ---- */
+    ModemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
+
+    /* ---- Auto-boot modem ---- */
+    pinMode(MODEM_PWR_PIN, OUTPUT);
+    digitalWrite(MODEM_PWR_PIN, LOW);
+    delay(100);
+    digitalWrite(MODEM_PWR_PIN, HIGH);
+    delay(1000);
+    digitalWrite(MODEM_PWR_PIN, LOW);
+
+    /* ---- AT readiness ---- */
+    uint32_t start = millis();
+    while (!modem.testAT(1000))
+    {
+        if (millis() - start > 30000)
+        {
+            Serial.println("❌ Modem AT timeout");
+            return false;
+        }
+        delay(500);
+    }
+
+    Serial.println("✅ Modem AT ready");
+
+    modem.sendAT("+CLTS=1");
+    modem.waitResponse();
+
+    modem.sendAT("+CTZR=1");
+    modem.waitResponse();
+
+    return true;
+}
+
+bool modem_get_timestamp(char *out, size_t out_len)
+{
+    Serial.println("🕒 Waiting for network registration (for valid time)...");
+
+    if (!wait_for_network(60000))
+    {
+        Serial.println("⚠ Network registration timeout → timestamp fallback");
+        snprintf(out, out_len, "UPT_%lu", millis() / 1000);
+        return false;
+    }
+
+    for (int attempt = 0; attempt < 10; attempt++)
+    {
+        modem.sendAT("+CCLK?");
+        if (modem.waitResponse(5000, "+CCLK:") != 1)
+        {
+            delay(1000);
+            continue;
+        }
+
+        String line = ModemSerial.readStringUntil('\n');
+        line.trim();
+
+        int q1 = line.indexOf('"');
+        int q2 = line.indexOf('"', q1 + 1);
+        if (q1 < 0 || q2 < 0)
+            continue;
+
+        String body = line.substring(q1 + 1, q2);
+        if (body.length() < 17)
+            continue;
+
+        int year = 2000 + body.substring(0, 2).toInt();
+        if (!year_plausible(year))
+        {
+            Serial.printf("⚠ Implausible modem year %d\n", year);
+            delay(1000);
+            continue;
+        }
+
+        snprintf(
+            out,
+            out_len,
+            "%04d%s%s_%s%s%s",
+            year,
+            body.substring(3,5).c_str(),
+            body.substring(6,8).c_str(),
+            body.substring(9,11).c_str(),
+            body.substring(12,14).c_str(),
+            body.substring(15,17).c_str()
+        );
+
+        Serial.printf("🕒 Modem timestamp: %s\n", out);
+        return true;
+    }
+
+    Serial.println("⚠ Failed to obtain valid modem time → fallback");
+    snprintf(out, out_len, "UPT_%lu", millis() / 1000);
+    return false;
 }
