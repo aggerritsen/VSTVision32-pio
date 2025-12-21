@@ -2,18 +2,19 @@
 #include "driver/uart.h"
 #include "esp_crc.h"
 #include "mbedtls/base64.h"
+
 #include "sdcard.h"
 #include "modem.h"
 
-
 /* =============================
-   UART CONFIG
+   BROKER UART CONFIG (XIAO ↔ T-SIM)
+   Use UART2 to avoid conflict with modem on Serial1/UART1.
    ============================= */
-static constexpr uart_port_t UART_PORT = UART_NUM_1;
-static constexpr int UART_RX_PIN = 18;
-static constexpr int UART_TX_PIN = 17;
-static constexpr int UART_BAUD   = 921600;
-static constexpr int UART_BUF_SZ = 4096;
+static constexpr uart_port_t BROKER_UART = UART_NUM_2;
+static constexpr int BROKER_RX_PIN = 18;     // from XIAO TX
+static constexpr int BROKER_TX_PIN = 17;     // to XIAO RX
+static constexpr int BROKER_BAUD   = 921600;
+static constexpr int BROKER_BUF_SZ = 4096;
 
 /* =============================
    RX STATE
@@ -36,6 +37,8 @@ static size_t   image_expected_len = 0;
 static uint32_t image_expected_crc = 0;
 static uint32_t frame_id = 0;
 
+static char g_timestamp[32] = {0};
+
 /* =============================
    UTIL
    ============================= */
@@ -53,7 +56,6 @@ bool jpeg_sanity_check(const uint8_t *buf, size_t len)
     if (len < 4)
         return false;
 
-    // SOI
     if (buf[0] != 0xFF || buf[1] != 0xD8)
     {
         Serial.println("❌ JPEG sanity: missing SOI");
@@ -75,27 +77,23 @@ bool jpeg_sanity_check(const uint8_t *buf, size_t len)
 
         uint8_t marker = buf[i + 1];
 
-        // Stuffed byte (FF 00)
         if (marker == 0x00)
         {
             i += 2;
             continue;
         }
 
-        // EOI
         if (marker == 0xD9)
         {
             found_eoi = true;
             break;
         }
 
-        // SOS (start of scan)
         if (marker == 0xDA)
         {
             found_sos = true;
             i += 2;
 
-            // Scan entropy data until EOI
             while (i + 1 < len)
             {
                 if (buf[i] == 0xFF && buf[i + 1] == 0xD9)
@@ -108,7 +106,6 @@ bool jpeg_sanity_check(const uint8_t *buf, size_t len)
             break;
         }
 
-        // Markers with length field
         if (i + 3 >= len)
         {
             Serial.println("❌ JPEG sanity: truncated marker");
@@ -141,10 +138,6 @@ bool jpeg_sanity_check(const uint8_t *buf, size_t len)
     return true;
 }
 
-
-/* =============================
-   BASE64 → JPEG DECODE
-   ============================= */
 bool decode_base64_to_jpeg(
     const String &b64,
     uint8_t **out_buf,
@@ -167,11 +160,7 @@ bool decode_base64_to_jpeg(
         return false;
     }
 
-    uint8_t *buf = (uint8_t *)heap_caps_malloc(
-        decoded_len,
-        MALLOC_CAP_8BIT
-    );
-
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(decoded_len, MALLOC_CAP_8BIT);
     if (!buf)
     {
         Serial.println("❌ JPEG buffer alloc failed");
@@ -198,6 +187,35 @@ bool decode_base64_to_jpeg(
 }
 
 /* =============================
+   BROKER UART INIT (UART2)
+   ============================= */
+static void broker_uart_init()
+{
+    uart_config_t cfg = {
+        .baud_rate = BROKER_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+
+    // Install driver for UART2 (separate from Serial1/UART1 modem)
+    uart_driver_install(BROKER_UART, BROKER_BUF_SZ, BROKER_BUF_SZ, 0, NULL, 0);
+    uart_param_config(BROKER_UART, &cfg);
+    uart_set_pin(
+        BROKER_UART,
+        BROKER_TX_PIN,
+        BROKER_RX_PIN,
+        UART_PIN_NO_CHANGE,
+        UART_PIN_NO_CHANGE
+    );
+
+    Serial.printf("UART2 broker configured (IDF driver) RX=%d TX=%d BAUD=%d\n",
+                  BROKER_RX_PIN, BROKER_TX_PIN, BROKER_BAUD);
+}
+
+/* =============================
    SETUP
    ============================= */
 void setup()
@@ -209,41 +227,23 @@ void setup()
     Serial.println(" T-SIM7080G-S3 | SSCMA UART RECEIVER ");
     Serial.println("=======================================");
 
-    char ts[32];
-
-    if (!modem_init_early()) {
-        Serial.println("⚠ Modem init failed");
+    // 1) Timestamp before everything (best effort)
+    bool ok_modem = modem_init_early();
+    if (ok_modem)
+    {
+        modem_get_timestamp(g_timestamp, sizeof(g_timestamp));
+        Serial.printf("🕒 Timestamp: %s\n", g_timestamp);
+    }
+    else
+    {
+        Serial.println("⚠ Modem init failed, continuing without timestamp");
+        snprintf(g_timestamp, sizeof(g_timestamp), "UPT%08lu", (unsigned long)(millis()/1000UL));
     }
 
-    if (modem_get_timestamp(ts, sizeof(ts))) {
-        Serial.print("🕒 Timestamp: ");
-        Serial.println(ts);
-    }
+    // 2) Broker UART (UART2)
+    broker_uart_init();
 
-
-    // --- existing UART config (UNCHANGED) ---
-    uart_config_t cfg = {
-        .baud_rate = UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_APB,
-    };
-
-    uart_driver_install(UART_PORT, UART_BUF_SZ, UART_BUF_SZ, 0, NULL, 0);
-    uart_param_config(UART_PORT, &cfg);
-    uart_set_pin(
-        UART_PORT,
-        UART_TX_PIN,
-        UART_RX_PIN,
-        UART_PIN_NO_CHANGE,
-        UART_PIN_NO_CHANGE
-    );
-
-    Serial.println("UART1 configured (IDF driver)");
-
-    // --- SD init stays as-is ---
+    // 3) SD card
     sdcard_init();
 }
 
@@ -254,7 +254,7 @@ void loop()
 {
     uint8_t c;
     int len = uart_read_bytes(
-        UART_PORT,
+        BROKER_UART,
         &c,
         1,
         20 / portTICK_PERIOD_MS
@@ -265,7 +265,6 @@ void loop()
 
     static String line;
 
-    /* -------- IMAGE BODY -------- */
     if (rx_state == READ_IMAGE)
     {
         image_base64 += (char)c;
@@ -278,7 +277,6 @@ void loop()
         return;
     }
 
-    /* -------- LINE MODE -------- */
     if (c == '\n')
     {
         line.trim();
@@ -305,11 +303,8 @@ void loop()
 
             image_base64.reserve(image_expected_len);
 
-            Serial.printf(
-                "📸 IMAGE header: len=%u crc=%08lx\n",
-                image_expected_len,
-                image_expected_crc
-            );
+            Serial.printf("📸 IMAGE header: len=%u crc=%08lx\n",
+                          (unsigned)image_expected_len, (unsigned long)image_expected_crc);
 
             rx_state = READ_IMAGE;
         }
@@ -323,8 +318,8 @@ void loop()
 
             Serial.println("=================================");
             Serial.printf("FRAME %lu COMPLETE\n", frame_id);
-            Serial.printf("CRC expected: %08lx\n", image_expected_crc);
-            Serial.printf("CRC computed: %08lx\n", crc);
+            Serial.printf("CRC expected: %08lx\n", (unsigned long)image_expected_crc);
+            Serial.printf("CRC computed: %08lx\n", (unsigned long)crc);
 
             if (crc == image_expected_crc)
             {
@@ -335,34 +330,33 @@ void loop()
 
                 if (decode_base64_to_jpeg(image_base64, &jpeg_buf, &jpeg_len))
                 {
-                    Serial.printf("🧩 JPEG decoded: %u bytes\n", jpeg_len);
+                    Serial.printf("🧩 JPEG decoded: %u bytes\n", (unsigned)jpeg_len);
 
                     if (jpeg_len >= 3)
                     {
-                        Serial.printf(
-                            "🧪 JPEG magic: %02X %02X %02X\n",
-                            jpeg_buf[0],
-                            jpeg_buf[1],
-                            jpeg_buf[2]
-                        );
+                        Serial.printf("🧪 JPEG magic: %02X %02X %02X\n",
+                                      jpeg_buf[0], jpeg_buf[1], jpeg_buf[2]);
                     }
 
                     jpeg_sanity_check(jpeg_buf, jpeg_len);
-                    
+
                     if (sdcard_available())
+                    {
+                        // This uses your existing sdcard.cpp logic
                         sdcard_save_jpeg(frame_id, jpeg_buf, jpeg_len);
+                    }
 
                     free(jpeg_buf);
                 }
 
                 String ack = "ACK " + String(frame_id) + "\n";
-                uart_write_bytes(UART_PORT, ack.c_str(), ack.length());
+                uart_write_bytes(BROKER_UART, ack.c_str(), ack.length());
             }
             else
             {
                 Serial.println("❌ CRC FAIL");
                 String nack = "NACK " + String(frame_id) + "\n";
-                uart_write_bytes(UART_PORT, nack.c_str(), nack.length());
+                uart_write_bytes(BROKER_UART, nack.c_str(), nack.length());
             }
 
             reset_frame();
