@@ -10,8 +10,7 @@
 #include "modem.h"
 
 /* =========================================================
-   BROKER UART CONFIG (XIAO ↔ T-SIM)
-   UART2 is used exclusively for broker traffic
+   BROKER UART CONFIG
    ========================================================= */
 static constexpr uart_port_t BROKER_UART = UART_NUM_2;
 static constexpr int BROKER_RX_PIN = 18;
@@ -40,7 +39,6 @@ static size_t   image_expected_len = 0;
 static uint32_t image_expected_crc = 0;
 static uint32_t frame_id = 0;
 
-/* Timestamp buffer */
 static char g_timestamp[32] = {0};
 
 /* =========================================================
@@ -55,38 +53,76 @@ static void reset_frame()
     rx_state = WAIT_JSON;
 }
 
+static bool is_digit(char c)
+{
+    return (c >= '0' && c <= '9');
+}
+
+static bool parse2(const char *p, int &out)
+{
+    if (!is_digit(p[0]) || !is_digit(p[1])) return false;
+    out = (p[0] - '0') * 10 + (p[1] - '0');
+    return true;
+}
+
+static bool parse4(const char *p, int &out)
+{
+    if (!is_digit(p[0]) || !is_digit(p[1]) ||
+        !is_digit(p[2]) || !is_digit(p[3])) return false;
+    out = (p[0] - '0') * 1000 +
+          (p[1] - '0') * 100 +
+          (p[2] - '0') * 10 +
+          (p[3] - '0');
+    return true;
+}
+
 /* =========================================================
-   SYSTEM TIME SET (robust & minimal)
-   Expected format: YYYYMMDD_HHMMSS
+   SYSTEM TIME SET
+   Prints EXACTLY:
+   🕒 SYSTEM TIME SET: YYYY-MM-DD HH:MM:SS
    ========================================================= */
 static bool set_system_time_from_timestamp(const char *ts)
 {
-    if (!ts || strlen(ts) < 15) {
-        Serial.println("❌ Invalid timestamp string");
+    if (!ts || strlen(ts) != 15 || ts[8] != '_')
         return false;
-    }
 
-    struct tm tm {};
-    tm.tm_year = atoi(ts + 0) - 1900;
-    tm.tm_mon  = atoi(ts + 4) - 1;
-    tm.tm_mday = atoi(ts + 6);
-    tm.tm_hour = atoi(ts + 9);
-    tm.tm_min  = atoi(ts + 11);
-    tm.tm_sec  = atoi(ts + 13);
-    tm.tm_isdst = 0;
+    int year, mon, day, hour, min, sec;
+
+    if (!parse4(ts + 0, year) ||
+        !parse2(ts + 4, mon)  ||
+        !parse2(ts + 6, day)  ||
+        !parse2(ts + 9, hour) ||
+        !parse2(ts + 11, min) ||
+        !parse2(ts + 13, sec))
+        return false;
+
+    if (year < 2024 || year > 2099 ||
+        mon  < 1    || mon  > 12   ||
+        day  < 1    || day  > 31   ||
+        hour < 0    || hour > 23   ||
+        min  < 0    || min  > 59   ||
+        sec  < 0    || sec  > 59)
+        return false;
+
+    struct tm tm{};
+    tm.tm_year = year - 1900;
+    tm.tm_mon  = mon - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min  = min;
+    tm.tm_sec  = sec;
+    tm.tm_isdst = -1;
 
     time_t t = mktime(&tm);
-    if (t <= 0) {
-        Serial.println("❌ mktime() failed, system time not set");
+    if (t < 0)
         return false;
-    }
 
-    struct timeval tv {
-        .tv_sec = t,
-        .tv_usec = 0
-    };
+    struct timeval tv{};
+    tv.tv_sec = t;
+    tv.tv_usec = 0;
     settimeofday(&tv, nullptr);
 
+    // ✅ EXACT REQUIRED OUTPUT LINE
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
     Serial.print("🕒 SYSTEM TIME SET: ");
@@ -100,35 +136,25 @@ static bool set_system_time_from_timestamp(const char *ts)
    ========================================================= */
 static bool jpeg_sanity_check(const uint8_t *buf, size_t len)
 {
-    if (len < 4 || buf[0] != 0xFF || buf[1] != 0xD8) {
-        Serial.println("❌ JPEG sanity: missing SOI");
+    if (len < 4 || buf[0] != 0xFF || buf[1] != 0xD8)
         return false;
-    }
 
     bool found_sos = false;
     bool found_eoi = false;
 
     for (size_t i = 2; i + 1 < len; i++) {
         if (buf[i] != 0xFF) continue;
-
         uint8_t marker = buf[i + 1];
         if (marker == 0x00) continue;
-
         if (marker == 0xDA) found_sos = true;
         if (marker == 0xD9) { found_eoi = true; break; }
     }
 
-    if (!found_sos || !found_eoi) {
-        Serial.println("❌ JPEG sanity: invalid marker structure");
-        return false;
-    }
-
-    Serial.println("✅ JPEG sanity: marker structure OK");
-    return true;
+    return found_sos && found_eoi;
 }
 
 /* =========================================================
-   BASE64 → JPEG DECODE
+   BASE64 → JPEG
    ========================================================= */
 static bool decode_base64_to_jpeg(
     const String &b64,
@@ -202,23 +228,15 @@ void setup()
     Serial.println(" T-SIM7080G-S3 | SSCMA UART RECEIVER ");
     Serial.println("=======================================");
 
-    /* 1️⃣ MODEM + TIME (FIRST, BLOCKING, BEST EFFORT) */
     Serial.println("📡 Modem early init (PMU + AT)");
     if (modem_init_early()) {
         if (modem_get_timestamp(g_timestamp, sizeof(g_timestamp))) {
             Serial.printf("🕒 Modem timestamp: %s\n", g_timestamp);
             set_system_time_from_timestamp(g_timestamp);
-        } else {
-            Serial.println("⚠ Modem time unavailable");
         }
-    } else {
-        Serial.println("⚠ Modem init failed");
     }
 
-    /* 2️⃣ BROKER UART */
     broker_uart_init();
-
-    /* 3️⃣ SD CARD */
     sdcard_init();
 }
 
@@ -250,7 +268,8 @@ void loop()
     if (rx_state == WAIT_JSON && line.startsWith("JSON ")) {
         json_buffer = line.substring(5);
         int idx = json_buffer.indexOf("\"frame\":");
-        if (idx >= 0) frame_id = json_buffer.substring(idx + 8).toInt();
+        if (idx >= 0)
+            frame_id = json_buffer.substring(idx + 8).toInt();
 
         Serial.println("🧠 INFERENCE");
         Serial.printf("Frame      : %lu\n", frame_id);
