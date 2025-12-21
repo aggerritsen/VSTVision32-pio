@@ -1,0 +1,9 @@
+
+[3] +1105ms invoke...
+invoke success
+perf: preprocess=7 inference=37 postprocess=0
+Box[0] target=3 score=50 x=273 y=250 w=220 h=197
+image_base64_len=15948
+🖼 image received
+heap_free=287068 heap_min=266896 psram=NO
+
