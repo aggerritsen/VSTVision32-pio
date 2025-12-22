@@ -1,4 +1,4 @@
 *.pio/
 *.vscode/
-*.test/
-*.versions/
+Receiver/test/
+Receiver/versions/
