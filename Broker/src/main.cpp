@@ -14,6 +14,11 @@ static constexpr int UART_TX_PIN = 43;
 static constexpr int UART_RX_PIN = 44;
 
 /* ================================
+   TRANSPORT ENABLE FLAG
+   ================================ */
+static constexpr bool ENABLE_UART_TRANSPORT = true; // switch to enable/disable UART transport
+
+/* ================================
    ACTUATORS
    ================================ */
 static constexpr int LED_PIN_1 = 1;   // D0, PIN 1, RED
@@ -66,6 +71,9 @@ void log_memory()
    ================================ */
 void send_cached_frame()
 {
+    if (!ENABLE_UART_TRANSPORT)
+        return;
+
     BrokerUART.print("JSON ");
     BrokerUART.println(cached_json);
 
@@ -99,7 +107,6 @@ bool prepare_frame()
     if (rc != CMD_OK)
         return false;
 
-    /* ---------- RAW INFERENCE LOG ---------- */
     Serial.println("🧠 RAW INFERENCE RESULT");
     Serial.printf("boxes: %u\n", AI.boxes().size());
 
@@ -119,7 +126,6 @@ bool prepare_frame()
             b.h
         );
 
-        /* ---------- LED LOGIC (NON-BLOCKING) ---------- */
         if (b.target == 3)
         {
             digitalWrite(LED_PIN_1, HIGH);
@@ -137,14 +143,8 @@ bool prepare_frame()
         }
     }
 
-    if (AI.boxes().empty())
-    {
-        Serial.println("  (no detections)");
-    }
-
     frame_id++;
 
-    /* ---------- Build inference JSON ---------- */
     cached_inf = "";
     cached_inf += "{\"frame\":";
     cached_inf += frame_id;
@@ -179,7 +179,6 @@ bool prepare_frame()
 
     cached_json = cached_inf;
 
-    /* ---------- Cache image ---------- */
     cached_image = AI.last_image();
     cached_image_len = cached_image.length();
 
@@ -207,16 +206,11 @@ void setup()
     pinMode(LED_PIN_1, OUTPUT);
     pinMode(LED_PIN_2, OUTPUT);
     pinMode(LED_PIN_3, OUTPUT);
-    
+
     uint32_t now = millis();
-    digitalWrite(LED_PIN_1, HIGH);
-        led1_until = now + LED_ON_MS;
-
-    digitalWrite(LED_PIN_2, HIGH);
-        led2_until = now + LED_ON_MS;
-
-    digitalWrite(LED_PIN_3, HIGH);
-        led3_until = now + LED_ON_MS;
+    digitalWrite(LED_PIN_1, HIGH); led1_until = now + LED_ON_MS;
+    digitalWrite(LED_PIN_2, HIGH); led2_until = now + LED_ON_MS;
+    digitalWrite(LED_PIN_3, HIGH); led3_until = now + LED_ON_MS;
 
     Serial.begin(115200);
     delay(500);
@@ -225,12 +219,15 @@ void setup()
     Serial.println(" XIAO ESP32-S3 | SSCMA UART BROKER ");
     Serial.println("=======================================");
 
-    BrokerUART.begin(
-        UART_BAUD,
-        SERIAL_8N1,
-        UART_RX_PIN,
-        UART_TX_PIN
-    );
+    if (ENABLE_UART_TRANSPORT)
+    {
+        BrokerUART.begin(
+            UART_BAUD,
+            SERIAL_8N1,
+            UART_RX_PIN,
+            UART_TX_PIN
+        );
+    }
 
     Wire.begin();
     Wire.setClock(400000);
@@ -252,63 +249,51 @@ void loop()
 {
     uint32_t now = millis();
 
-    /* ---------- LED timeout handling ---------- */
-    if (led1_until && now > led1_until)
-    {
-        digitalWrite(LED_PIN_1, LOW);
-        led1_until = 0;
-    }
+    if (led1_until && now > led1_until) { digitalWrite(LED_PIN_1, LOW); led1_until = 0; }
+    if (led2_until && now > led2_until) { digitalWrite(LED_PIN_2, LOW); led2_until = 0; }
+    if (led3_until && now > led3_until) { digitalWrite(LED_PIN_3, LOW); led3_until = 0; }
 
-    if (led2_until && now > led2_until)
+    if (ENABLE_UART_TRANSPORT)
     {
-        digitalWrite(LED_PIN_2, LOW);
-        led2_until = 0;
-    }
-
-    if (led3_until && now > led3_until)
-    {
-        digitalWrite(LED_PIN_3, LOW);
-        led3_until = 0;
-    }
-
-    /* ---------- Handle ACK / NACK ---------- */
-    while (BrokerUART.available())
-    {
-        String line = BrokerUART.readStringUntil('\n');
-        line.trim();
-
-        if (line.startsWith("ACK "))
+        while (BrokerUART.available())
         {
-            uint32_t ack_id = line.substring(4).toInt();
-            if (ack_id == frame_id)
+            String line = BrokerUART.readStringUntil('\n');
+            line.trim();
+
+            if (line.startsWith("ACK "))
             {
-                awaiting_ack = false;
-                Serial.printf("✅ ACK %lu\n", ack_id);
+                uint32_t ack_id = line.substring(4).toInt();
+                if (ack_id == frame_id)
+                {
+                    awaiting_ack = false;
+                    Serial.printf("✅ ACK %lu\n", ack_id);
+                }
+            }
+            else if (line.startsWith("NACK "))
+            {
+                uint32_t nack_id = line.substring(5).toInt();
+                if (nack_id == frame_id)
+                {
+                    Serial.printf("🔁 NACK %lu → resend\n", nack_id);
+                    send_cached_frame();
+                }
             }
         }
-        else if (line.startsWith("NACK "))
+
+        if (awaiting_ack && millis() - last_send_ms > ACK_TIMEOUT_MS)
         {
-            uint32_t nack_id = line.substring(5).toInt();
-            if (nack_id == frame_id)
-            {
-                Serial.printf("🔁 NACK %lu → resend\n", nack_id);
-                send_cached_frame();
-            }
+            Serial.printf("⏱ ACK timeout for frame %lu → resend\n", frame_id);
+            send_cached_frame();
+            return;
         }
     }
 
-    /* ---------- Timeout ---------- */
-    if (awaiting_ack && millis() - last_send_ms > ACK_TIMEOUT_MS)
-    {
-        Serial.printf("⏱ ACK timeout for frame %lu → resend\n", frame_id);
-        send_cached_frame();
-        return;
-    }
-
-    /* ---------- Send next frame ---------- */
     if (!awaiting_ack)
     {
         if (prepare_frame())
-            send_cached_frame();
+        {
+            if (ENABLE_UART_TRANSPORT)
+                send_cached_frame();
+        }
     }
 }
