@@ -4,7 +4,26 @@
 
 This project implements a **stable, frozen broker** that connects a **Grove Vision AI (SSCMA)** device to downstream systems using a **Seeed Studio XIAO ESP32-S3** as an intermediary.
 
-The broker reliably:
+---
+
+## Board Pinout
+
+![XIAO-ESP32S3 Pinout](../docs\Seeed-XIAO-ESP32-S3-Pinout.jpg)
+
+*Pinout diagram for the XIAO-ESP32-S3.*
+For information on getting started with the ESP32-S3 board, see the
+[XIAO ESP32S3 Getting Started guide on the Seeed Studio Wiki](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/).
+
+This board is used in the XIAO Grove shield.
+
+![XIAO Grove SHield Pinout](../docs\xiao_Grove_shield_pinout.png)
+
+For details on the Grove Shield and its embedded battery management features, see the
+[Grove Shield for Seeeduino XIAO – Embedded Battery Management Chip guide on the Seeed Studio Wiki](https://wiki.seeedstudio.com/Grove-Shield-for-Seeeduino-XIAO-embedded-battery-management-chip/).
+
+---
+
+This broker reliably:
 - Communicates with **Grove Vision AI over I²C**
 - Triggers inference using the **SSCMA protocol**
 - Retrieves **inference results and image data**
