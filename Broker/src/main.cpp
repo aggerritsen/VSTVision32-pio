@@ -13,6 +13,20 @@ static constexpr uint32_t UART_BAUD = 921600;
 static constexpr int UART_TX_PIN = 43;
 static constexpr int UART_RX_PIN = 44;
 
+/* ================================
+   ACTUATORS
+   ================================ */
+static constexpr int LED_PIN_1 = 1;   // D0, PIN 1, RED
+static constexpr int LED_PIN_2 = 2;   // D1, PIN 2, GREEN
+static constexpr int LED_PIN_3 = 3;   // D2, PIN 3, WHITE
+
+/* LED timing */
+static constexpr uint32_t LED_ON_MS = 1000;
+
+static uint32_t led1_until = 0;
+static uint32_t led2_until = 0;
+static uint32_t led3_until = 0;
+
 HardwareSerial BrokerUART(1);
 
 /* ================================
@@ -29,7 +43,7 @@ static uint32_t last_send_ms = 0;
 
 /* Cached frame (for resend) */
 static String cached_json;
-static String cached_inf;          // ✅ NEW
+static String cached_inf;
 static String cached_image;
 static size_t cached_image_len = 0;
 static uint32_t cached_image_crc = 0;
@@ -52,22 +66,18 @@ void log_memory()
    ================================ */
 void send_cached_frame()
 {
-    /* JSON (unchanged, backward compatible) */
     BrokerUART.print("JSON ");
     BrokerUART.println(cached_json);
 
-    /* INF (new, inference-only) */
     BrokerUART.print("INF ");
     BrokerUART.println(cached_inf);
 
-    /* IMAGE */
     BrokerUART.print("IMAGE ");
     BrokerUART.print(cached_image_len);
     BrokerUART.print(" ");
     BrokerUART.printf("%08lx\n", cached_image_crc);
     BrokerUART.print(cached_image);
 
-    /* END */
     BrokerUART.println("END");
 
     last_send_ms = millis();
@@ -89,9 +99,52 @@ bool prepare_frame()
     if (rc != CMD_OK)
         return false;
 
+    /* ---------- RAW INFERENCE LOG ---------- */
+    Serial.println("🧠 RAW INFERENCE RESULT");
+    Serial.printf("boxes: %u\n", AI.boxes().size());
+
+    uint32_t now = millis();
+
+    for (size_t i = 0; i < AI.boxes().size(); i++)
+    {
+        auto &b = AI.boxes()[i];
+        Serial.printf(
+            "  [%u] target=%u score=%u x=%u y=%u w=%u h=%u\n",
+            i,
+            b.target,
+            b.score,
+            b.x,
+            b.y,
+            b.w,
+            b.h
+        );
+
+        /* ---------- LED LOGIC (NON-BLOCKING) ---------- */
+        if (b.target == 3)
+        {
+            digitalWrite(LED_PIN_1, HIGH);
+            led1_until = now + LED_ON_MS;
+        }
+        else if (b.target == 2)
+        {
+            digitalWrite(LED_PIN_2, HIGH);
+            led2_until = now + LED_ON_MS;
+        }
+        else if (b.target == 3)
+        {
+            digitalWrite(LED_PIN_3, HIGH);
+            led3_until = now + LED_ON_MS;
+        }
+    }
+
+    if (AI.boxes().empty())
+    {
+        Serial.println("  (no detections)");
+    }
+
     frame_id++;
 
-    /* ---------- Build inference JSON (NEW) ---------- */
+    /* ---------- Build inference JSON ---------- */
     cached_inf = "";
     cached_inf += "{\"frame\":";
     cached_inf += frame_id;
@@ -124,8 +177,7 @@ bool prepare_frame()
     }
     cached_inf += "]}";
 
-    /* ---------- Build legacy JSON (UNCHANGED) ---------- */
-    cached_json = cached_inf;  // identical content, preserved for compatibility
+    cached_json = cached_inf;
 
     /* ---------- Cache image ---------- */
     cached_image = AI.last_image();
@@ -152,6 +204,14 @@ bool prepare_frame()
    ================================ */
 void setup()
 {
+    pinMode(LED_PIN_1, OUTPUT);
+    pinMode(LED_PIN_2, OUTPUT);
+    pinMode(LED_PIN_3, OUTPUT);
+
+    digitalWrite(LED_PIN_1, LOW);
+    digitalWrite(LED_PIN_2, LOW);
+    digitalWrite(LED_PIN_3, LOW);
+
     Serial.begin(115200);
     delay(500);
 
@@ -169,7 +229,8 @@ void setup()
     Wire.begin();
     Wire.setClock(400000);
 
-    if (!AI.begin(&Wire)) {
+    if (!AI.begin(&Wire))
+    {
         Serial.println("❌ SSCMA init failed");
         while (1);
     }
@@ -183,6 +244,27 @@ void setup()
    ================================ */
 void loop()
 {
+    uint32_t now = millis();
+
+    /* ---------- LED timeout handling ---------- */
+    if (led1_until && now > led1_until)
+    {
+        digitalWrite(LED_PIN_1, LOW);
+        led1_until = 0;
+    }
+
+    if (led2_until && now > led2_until)
+    {
+        digitalWrite(LED_PIN_2, LOW);
+        led2_until = 0;
+    }
+
+    if (led3_until && now > led3_until)
+    {
+        digitalWrite(LED_PIN_3, LOW);
+        led3_until = 0;
+    }
+
     /* ---------- Handle ACK / NACK ---------- */
     while (BrokerUART.available())
     {
