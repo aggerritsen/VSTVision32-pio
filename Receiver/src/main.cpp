@@ -1,5 +1,3 @@
-// main.cpp
-
 #include <Arduino.h>
 #include <sys/time.h>
 #include <time.h>
@@ -80,8 +78,6 @@ static bool parse4(const char *p, int &out)
 
 /* =========================================================
    SYSTEM TIME SET
-   Prints EXACTLY:
-   🕒 SYSTEM TIME SET: YYYY-MM-DD HH:MM:SS
    ========================================================= */
 static bool set_system_time_from_timestamp(const char *ts)
 {
@@ -96,14 +92,6 @@ static bool set_system_time_from_timestamp(const char *ts)
         !parse2(ts + 9, hour) ||
         !parse2(ts + 11, min) ||
         !parse2(ts + 13, sec))
-        return false;
-
-    if (year < 2024 || year > 2099 ||
-        mon  < 1    || mon  > 12   ||
-        day  < 1    || day  > 31   ||
-        hour < 0    || hour > 23   ||
-        min  < 0    || min  > 59   ||
-        sec  < 0    || sec  > 59)
         return false;
 
     struct tm tm{};
@@ -124,7 +112,6 @@ static bool set_system_time_from_timestamp(const char *ts)
     tv.tv_usec = 0;
     settimeofday(&tv, nullptr);
 
-    // ✅ EXACT REQUIRED OUTPUT LINE
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
     Serial.print("🕒 SYSTEM TIME SET: ");
@@ -267,7 +254,10 @@ void loop()
 
     line.trim();
 
-    if (rx_state == WAIT_JSON && line.startsWith("JSON ")) {
+    /* ---------- GLOBAL RESYNC ON JSON ---------- */
+    if (line.startsWith("JSON ")) {
+        reset_frame();
+
         json_buffer = line.substring(5);
         int idx = json_buffer.indexOf("\"frame\":");
         if (idx >= 0)
@@ -278,8 +268,11 @@ void loop()
         Serial.println(json_buffer);
 
         rx_state = WAIT_IMAGE_HEADER;
+        line = "";
+        return;
     }
-    else if (rx_state == WAIT_IMAGE_HEADER && line.startsWith("IMAGE ")) {
+
+    if (rx_state == WAIT_IMAGE_HEADER && line.startsWith("IMAGE ")) {
         sscanf(line.c_str(), "IMAGE %zu %lx",
                &image_expected_len, &image_expected_crc);
 
@@ -305,6 +298,7 @@ void loop()
             }
 
             free(jpeg);
+
             String ack = "ACK " + String(frame_id) + "\n";
             uart_write_bytes(BROKER_UART, ack.c_str(), ack.length());
         }

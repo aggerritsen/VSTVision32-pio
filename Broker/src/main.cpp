@@ -207,10 +207,16 @@ void setup()
     pinMode(LED_PIN_1, OUTPUT);
     pinMode(LED_PIN_2, OUTPUT);
     pinMode(LED_PIN_3, OUTPUT);
+    
+    uint32_t now = millis();
+    digitalWrite(LED_PIN_1, HIGH);
+        led1_until = now + LED_ON_MS;
 
-    digitalWrite(LED_PIN_1, LOW);
-    digitalWrite(LED_PIN_2, LOW);
-    digitalWrite(LED_PIN_3, LOW);
+    digitalWrite(LED_PIN_2, HIGH);
+        led2_until = now + LED_ON_MS;
+
+    digitalWrite(LED_PIN_3, HIGH);
+        led3_until = now + LED_ON_MS;
 
     Serial.begin(115200);
     delay(500);
