@@ -26,9 +26,6 @@ T-SIM7080G-S3 (Receiver)
 
 ## 2. Broker (XIAO ESP32-S3)
 
-> **Current status:** running in **Arduino IDE**  
-> (PlatformIO migration planned later)
-
 ### Responsibilities
 
 - Receives frames from **Groove Vision AI** over **I²C** using [SSCMA libraries from Seeed](https://github.com/Seeed-Studio/Seeed_Arduino_SSCMA)
