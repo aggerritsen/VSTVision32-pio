@@ -8,7 +8,7 @@ This project implements a **stable, frozen broker** that connects a **Grove Visi
 
 ## Board Pinout
 
-![XIAO-ESP32S3 Pinout](../docs\Seeed-XIAO-ESP32-S3-Pinout.jpg)
+![XIAO-ESP32S3 Pinout](../docs/Seeed-XIAO-ESP32-S3-Pinout.jpg)
 
 *Pinout diagram for the XIAO-ESP32-S3.*
 For information on getting started with the ESP32-S3 board, see the
@@ -16,7 +16,7 @@ For information on getting started with the ESP32-S3 board, see the
 
 This board is used in the XIAO Grove shield.
 
-![XIAO Grove SHield Pinout](../docs\xiao_Grove_shield_pinout.png)
+![XIAO Grove SHield Pinout](../docs/xiao_Grove_shield_pinout.png)
 
 For details on the Grove Shield and its embedded battery management features, see the
 [Grove Shield for Seeeduino XIAO – Embedded Battery Management Chip guide on the Seeed Studio Wiki](https://wiki.seeedstudio.com/Grove-Shield-for-Seeeduino-XIAO-embedded-battery-management-chip/).
