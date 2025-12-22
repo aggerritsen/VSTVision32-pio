@@ -7,7 +7,7 @@ The system is intentionally **crypto-free**, **deterministic**, and **observable
 
 ---
 
-## 1. High-Level Architecture
+## High-Level Architecture
 ```
 Grove Vision AI
    │ (I2C)
@@ -21,7 +21,15 @@ T-SIM7080G-S3 (Receiver)
    ├─ SD card storage
    └─ Modem ready for SMS / Cloud
 ```
+## 1. Seeed Vision AI
 
+The principal component of this development in the Seeed Vision AI V2 module that will contain the [Vespa Velutiona Detection model](https://sensecraft.seeed.cc/ai/view-model/61707-vespa-velutina-detection) which is available at the [SenseCraft AI website](https://sensecraft.seeed.cc/ai/home). This module is linked wiht the Raspberri Pi CAM V.13
+
+![Seeed Vision AI V2](docs\Grove-Vision-AI-Module-V2.jpg)
+
+![Seeed Vision AI V2](docs\Grove-Vision-AI-Module-V2-functions.jpg)
+
+![Raspberri Pi CAM V.13](docs\raspberry-pi-camera-rev-1.3.jpg)
 ---
 
 ## 2. Broker (XIAO ESP32-S3)
