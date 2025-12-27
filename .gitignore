@@ -2,3 +2,12 @@
 *.vscode/
 Receiver/test/
 Receiver/versions/
+
+# --- Allow ONLY selected PlatformIO binaries ---
+!broker/.pio/build/xiao-esp32s3/bootloader.bin
+!broker/.pio/build/xiao-esp32s3/partitions.bin
+!broker/.pio/build/xiao-esp32s3/firmware.bin
+
+!receiver/.pio/build/t-sim7080g-s3/bootloader.bin
+!receiver/.pio/build/t-sim7080g-s3/partitions.bin
+!receiver/.pio/build/t-sim7080g-s3/firmware.bin
