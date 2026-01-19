@@ -16,13 +16,13 @@ After the cover is out the PCB will be exposed, you’ll see three main thick tr
 The new motor windings will be 1 (Orange, Pink) and 2 (Yellow, Blue), you may cut the red wire on unsolder it from the PCB.
 ![PCB](image-2.png)
 
-|Color	|Winding	|Side|Channel|
-|------|--------|---------|---|
-|Yellow	|2	|A|CH2 (-)
-|Orange	|1	|A|CH1 (-)
-|Red	|N/A	|N/A|
-|Pink	|1	|B|CH1 (+)
-|Blue	|2	|B|CH2 (+)
+|Color	|Winding	|Side|Channel|header|
+|------|--------|---------|---|----|
+|Red	|N/A	|N/A||P1|
+|Orange	|1	|A|CH1 (-)|P2|
+|Yellow	|2	|A|CH2 (-)|P3|
+|Pink	|1	|B|CH1 (+)|P4|
+|Blue	|2	|B|CH2 (+)|P5|
 
 ![ALternate Wiring](image-4.png)
 

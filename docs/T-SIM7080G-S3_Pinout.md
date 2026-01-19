@@ -5,9 +5,9 @@
 | P1.1   | 3V3 |          | Power            |                      |
 | P1.2   | GND |          | Ground           |                      |
 | P1.3   |      | GPIO16  | U0CTS            | ADC2_CH5             |
-| P1.4   |      | GPIO17  | U1TXD            | ADC2_CH6             |
-| P1.5   |      | GPIO18  | U1RXD            | ADC2_CH7             |
-| P1.6   |      | GPIO08  | TOUCH08          | ADC1_CH7             |
+| P1.4   | TX   | GPIO17  | U1TXD            | ADC2_CH6             |
+| P1.5   | RX   | GPIO18  | U1RXD            | ADC2_CH7             |
+| P1.6   | SCL  | GPIO08  | TOUCH08          | ADC1_CH7             |
 | P1.7   | SDA  | GPIO03  | TOUCH03          | ADC1_CH2             |
 | P1.8   |      | GPIO46  |                  |                      |
 | P1.9   |      | GPIO09  | TOUCH09 / FSPIHD | ADC1_CH8             |
