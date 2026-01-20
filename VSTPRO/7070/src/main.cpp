@@ -1,7 +1,7 @@
-// src/main.cpp (RFC) — PMU + MODEM(time) + SD + VisionAI (SSCMA on Wire1)
-// - Blocks until modem timestamp obtained
-// - Sets system time from modem timestamp
-// - SD filenames use SYSTEM TIME (not modem query per frame)
+// src/main.cpp (RFC)
+// - Always initialize MODEM/TIME first, then SD, then VisionAI
+// - If VisionAI is missing, DO NOT stall/reset; keep running and retry VisionAI init periodically
+// - SD filenames use SYSTEM TIME (set from modem timestamp at boot)
 
 #include <Arduino.h>
 #include <sys/time.h>
@@ -128,13 +128,37 @@ static void obtain_modem_timestamp_and_set_time_blocking()
                 continue;
             }
 
-            // Inform SD layer that system time is valid now (used for filenames)
             sdcard_set_time_valid(true);
+            Serial.println("[PHASE 1] DONE");
             return;
         }
 
         Serial.println("⚠️ No modem timestamp yet; retrying in 5s");
         delay(5000);
+    }
+}
+
+/* =========================================================
+   VisionAI init retry (non-fatal)
+   ========================================================= */
+static bool g_vision_ok = false;
+static uint32_t g_next_vision_retry_ms = 0;
+static constexpr uint32_t VISION_RETRY_MS = 3000;
+
+static void try_visionai_begin_now()
+{
+    Serial.println("[PHASE 3] VisionAI INIT");
+    if (VisionAI::begin())
+    {
+        Serial.println("[PHASE 3] DONE");
+        Serial.println("✅ VisionAI ready");
+        g_vision_ok = true;
+    }
+    else
+    {
+        Serial.println("⚠️ VisionAI not detected/ready (continuing without it)");
+        g_vision_ok = false;
+        g_next_vision_retry_ms = millis() + VISION_RETRY_MS;
     }
 }
 
@@ -154,39 +178,51 @@ void setup()
     digitalWrite(LED_PIN_2, LOW);
     digitalWrite(LED_PIN_3, LOW);
 
+    // IMPORTANT ORDER:
+    // 1) MODEM/TIME
     Serial.println("[PHASE 1] MODEM + TIME");
     obtain_modem_timestamp_and_set_time_blocking();
-    Serial.println("[PHASE 1] DONE");
 
+    // 2) SD
     Serial.println("[PHASE 2] SD INIT");
     bool sd_ok = sdcard_init();
     Serial.printf("[PHASE 2] DONE (sd_ok=%s)\n", sd_ok ? "true" : "false");
 
-    Serial.println("[PHASE 3] VisionAI INIT");
-    if (!VisionAI::begin())
-    {
-        Serial.println("❌ VisionAI::begin failed");
-        while (1) delay(100);
-    }
-    Serial.println("[PHASE 3] DONE");
+    // 3) VisionAI (non-fatal if missing)
+    try_visionai_begin_now();
 
     Serial.println("✅ SETUP COMPLETE -> entering loop()");
+    log_memory();
 }
-
 
 void loop()
 {
     leds_service();
 
+    // If VisionAI is not ready, keep the system alive and retry periodically.
+    if (!g_vision_ok)
+    {
+        uint32_t now = millis();
+        if (g_next_vision_retry_ms && (int32_t)(now - g_next_vision_retry_ms) >= 0)
+        {
+            Serial.println("♻️ Retrying VisionAI::begin...");
+            try_visionai_begin_now();
+        }
+        delay(50);
+        return;
+    }
+
     VisionAI::LoopResult r = VisionAI::loop_once();
 
     if (r.ok)
     {
+        // pulse LEDs for detected targets
         for (size_t i = 0; i < r.box_count; i++)
         {
             leds_pulse_for_target(r.targets[i]);
         }
 
+        // Save JPEG (kept enabled for debugging)
         if (sdcard_available() && r.jpeg && r.jpeg_len)
         {
             (void)sdcard_save_jpeg(r.frame_id, r.jpeg, r.jpeg_len);
@@ -194,6 +230,7 @@ void loop()
     }
     else
     {
+        // SSCMA stalled / error -> best-effort reinit
         (void)VisionAI::reinit();
         delay(250);
     }
