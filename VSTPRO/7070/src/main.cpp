@@ -165,7 +165,7 @@ static void try_visionai_begin_now()
 void setup()
 {
     Serial.begin(115200);
-    delay(800); // give monitor time to attach
+    delay(5000); // give monitor time to attach
     Serial.println();
     Serial.println("=======================================");
     Serial.println(" VSTPRO BOOT");
