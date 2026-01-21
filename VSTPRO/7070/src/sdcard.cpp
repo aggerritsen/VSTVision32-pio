@@ -1,233 +1,186 @@
-// src/sdcard.cpp (RFC)
-//  - VST_BOARD_7070: SPI SD (SD.h) using pins from config.h: SD_SPI_MISO/MOSI/SCLK/CS
-//  - VST_BOARD_7080: SD_MMC (optional path), pins from config.h: SD_CMD/SD_CLK/SD_DATA
-//
-// Keeps existing API used by main.cpp:
-//   - sdcard_available()
-//   - sdcard_save_jpeg(frame_id, jpg, jpg_len)
-//   - sdcard_set_time_valid(bool)
+// src/sdcard.cpp (RFC) — dual-board SD support
+//  - 7070: SD over SPI (SD library)
+//  - 7080: SD over SD_MMC (SD_MMC library)
+//  - Filenames can use SYSTEM TIME once modem time is set
 
 #include "sdcard.h"
 #include "config.h"
-
+#include <cstdio>
+#include <time.h>
 #include <Arduino.h>
 
-static bool g_sd_ok = false;
-static bool g_time_valid = false;
-static char g_time_prefix[32] = {0};
+static bool sd_ok = false;
+static bool time_valid = false;
 
-// ----------------------------
-// 7070: SPI SD
-// ----------------------------
+void sdcard_set_time_valid(bool valid)
+{
+    time_valid = valid;
+    Serial.printf("🕒 SD time_valid=%s\n", time_valid ? "true" : "false");
+}
+
+static bool format_now_timestamp(char *out, size_t out_sz)
+{
+    if (!out || out_sz < 16) return false; // "YYYYMMDD_HHMMSS" + null
+
+    time_t now = time(nullptr);
+    if (now <= 0) return false;
+
+    struct tm tm{};
+    localtime_r(&now, &tm);
+
+    int year = tm.tm_year + 1900;
+    if (year < 2020) return false;
+
+    snprintf(out, out_sz, "%04d%02d%02d_%02d%02d%02d",
+             year,
+             tm.tm_mon + 1,
+             tm.tm_mday,
+             tm.tm_hour,
+             tm.tm_min,
+             tm.tm_sec);
+
+    return true;
+}
+
 #if defined(VST_BOARD_7070)
 
+// -----------------------------
+// 7070: SD over SPI (SD library)
+// -----------------------------
 #include <SPI.h>
 #include <SD.h>
 
 static SPIClass g_sd_spi(VSPI);
 
-static bool sd_mount_spi()
-{
-    Serial.println("📀 Initializing SD card (SPI, custom pins)...");
-    // Pins must come from config.h:
-    //   SD_SPI_SCLK, SD_SPI_MISO, SD_SPI_MOSI, SD_SPI_CS
-    g_sd_spi.begin(SD_SPI_SCLK, SD_SPI_MISO, SD_SPI_MOSI, SD_SPI_CS);
-
-    if (!SD.begin(SD_SPI_CS, g_sd_spi, 4000000))
-    {
-        Serial.println("❌ SD SPI mount failed");
-        return false;
-    }
-
-    Serial.println("✅ SD card mounted (SPI)");
-    return true;
-}
-
-static bool write_file_spi(const char *path, const uint8_t *data, size_t len)
-{
-    File f = SD.open(path, FILE_WRITE);
-    if (!f)
-    {
-        Serial.printf("❌ SD.open failed: %s\n", path);
-        return false;
-    }
-
-    size_t w = f.write(data, len);
-    f.close();
-
-    if (w != len)
-    {
-        Serial.printf("❌ SD write short: %s (%u/%u)\n", path, (unsigned)w, (unsigned)len);
-        return false;
-    }
-    return true;
-}
-
-static void sd_stats_spi()
-{
-    uint8_t cardType = SD.cardType();
-    if (cardType == CARD_NONE)
-    {
-        Serial.println("⚠️ No SD card attached");
-        return;
-    }
-
-    uint64_t cardSize = SD.cardSize();
-    Serial.printf("📦 SD size : %llu MB\n", (unsigned long long)(cardSize / (1024ULL * 1024ULL)));
-}
-
-#endif // VST_BOARD_7070
-
-// ----------------------------
-// 7080: SD_MMC (kept for later; won’t affect 7070 build)
-// ----------------------------
-#if defined(VST_BOARD_7080)
-
-#include <FS.h>
-#include <SD_MMC.h>
-
-static bool sd_mount_sdmmc()
-{
-    Serial.println("📀 Initializing SD card (SD_MMC, custom pins)...");
-
-#if defined(ESP_ARDUINO_VERSION)
-    // If available in your core:
-    SD_MMC.setPins(SD_CMD, SD_CLK, SD_DATA);
-#endif
-
-    bool ok = SD_MMC.begin("/sdcard", true /*1-bit*/, false /*format*/, 20000000 /*freq*/);
-    if (!ok)
-    {
-        Serial.println("❌ SD_MMC mount failed");
-        return false;
-    }
-
-    Serial.println("✅ SD card mounted (SD_MMC)");
-    return true;
-}
-
-static bool write_file_sdmmc(const char *path, const uint8_t *data, size_t len)
-{
-    File f = SD_MMC.open(path, FILE_WRITE);
-    if (!f)
-    {
-        Serial.printf("❌ SD_MMC.open failed: %s\n", path);
-        return false;
-    }
-
-    size_t w = f.write(data, len);
-    f.close();
-
-    if (w != len)
-    {
-        Serial.printf("❌ SD_MMC write short: %s (%u/%u)\n", path, (unsigned)w, (unsigned)len);
-        return false;
-    }
-    return true;
-}
-
-static void sd_stats_sdmmc()
-{
-    uint64_t cardSize = SD_MMC.cardSize();
-    Serial.printf("📦 SD size : %llu MB\n", (unsigned long long)(cardSize / (1024ULL * 1024ULL)));
-}
-
-#endif // VST_BOARD_7080
-
-// ----------------------------
-// Common helpers
-// ----------------------------
-void sdcard_set_time_valid(bool valid)
-{
-    g_time_valid = valid;
-}
-
-void sdcard_set_time_prefix(const char *ts)
-{
-    if (!ts || !*ts)
-    {
-        g_time_prefix[0] = 0;
-        return;
-    }
-    strncpy(g_time_prefix, ts, sizeof(g_time_prefix) - 1);
-    g_time_prefix[sizeof(g_time_prefix) - 1] = 0;
-}
-
-static void build_frame_path(char *out, size_t out_len, uint32_t frame_id)
-{
-    // Keep it simple and stable. If time prefix is set and valid, use it.
-    if (g_time_valid && g_time_prefix[0])
-    {
-        snprintf(out, out_len, "/%s_frame_%06lu.jpg",
-                 g_time_prefix, (unsigned long)frame_id);
-    }
-    else
-    {
-        // fallback
-        snprintf(out, out_len, "/frame_%06lu_ms_%08lu.jpg",
-                 (unsigned long)frame_id, (unsigned long)millis());
-    }
-}
-
-// ----------------------------
-// Public API (matches main.cpp)
-// ----------------------------
 bool sdcard_init()
 {
-    g_sd_ok = false;
+    Serial.println("📀 Initializing SD card (SPI, custom pins)...");
 
-#if defined(VST_BOARD_7070)
-    g_sd_ok = sd_mount_spi();
-    if (g_sd_ok) sd_stats_spi();
-#elif defined(VST_BOARD_7080)
-    g_sd_ok = sd_mount_sdmmc();
-    if (g_sd_ok) sd_stats_sdmmc();
-#else
-#error "Define VST_BOARD_7070 or VST_BOARD_7080"
-#endif
+    // config.h must define:
+    // SD_SPI_MISO, SD_SPI_MOSI, SD_SPI_SCK, SD_SPI_CS
+    g_sd_spi.begin(SD_SPI_SCLK, SD_SPI_MISO, SD_SPI_MOSI, SD_SPI_CS);
 
-    return g_sd_ok;
+    if (!SD.begin(SD_SPI_CS, g_sd_spi))
+    {
+        Serial.println("❌ SD (SPI) mount failed");
+        sd_ok = false;
+        return false;
+    }
+
+    uint64_t size = SD.cardSize();
+    Serial.printf("✅ SD card mounted (SPI)\n");
+    Serial.printf("📦 SD size : %llu MB\n", size / (1024 * 1024));
+
+    sd_ok = true;
+    return true;
 }
 
 bool sdcard_available()
 {
-    return g_sd_ok;
+    return sd_ok;
 }
 
-bool sdcard_save_jpeg(uint32_t frame_id, const uint8_t *jpg, size_t jpg_len)
+bool sdcard_save_jpeg(uint32_t frame_id, const uint8_t *data, size_t len)
 {
-    if (!g_sd_ok || !jpg || jpg_len == 0) return false;
+    if (!sd_ok) return false;
 
+    char ts[20] = {0};
     char path[96];
-    build_frame_path(path, sizeof(path), frame_id);
 
-    bool ok = false;
+    if (time_valid && format_now_timestamp(ts, sizeof(ts)))
+        snprintf(path, sizeof(path), "/%s_frame_%06lu.jpg", ts, (unsigned long)frame_id);
+    else
+        snprintf(path, sizeof(path), "/frame_%06lu.jpg", (unsigned long)frame_id);
 
-#if defined(VST_BOARD_7070)
-    ok = write_file_spi(path, jpg, jpg_len);
-#elif defined(VST_BOARD_7080)
-    ok = write_file_sdmmc(path, jpg, jpg_len);
-#endif
-
-    if (ok)
+    File f = SD.open(path, FILE_WRITE);
+    if (!f)
     {
-        Serial.printf("💾 JPEG saved: %s (%u bytes)\n", path, (unsigned)jpg_len);
+        Serial.printf("❌ Failed to open %s\n", path);
+        return false;
     }
 
-    return ok;
+    size_t written = f.write(data, len);
+    f.close();
+
+    if (written != len)
+    {
+        Serial.printf("❌ SD write incomplete (%u / %u)\n", (unsigned)written, (unsigned)len);
+        return false;
+    }
+
+    Serial.printf("💾 JPEG saved: %s (%u bytes)\n", path, (unsigned)len);
+    return true;
 }
 
-void sdcard_print_stats()
+#elif defined(VST_BOARD_7080)
+
+// -----------------------------
+// 7080: SD over SD_MMC
+// -----------------------------
+#include <SD_MMC.h>
+
+bool sdcard_init()
 {
-    if (!g_sd_ok)
+    Serial.println("📀 Initializing SD card (SD_MMC, custom pins)...");
+
+    // config.h must define: SD_CLK, SD_CMD, SD_DATA
+    SD_MMC.setPins(SD_CLK, SD_CMD, SD_DATA);
+
+    if (!SD_MMC.begin("/sdcard", true))
     {
-        Serial.println("⚠️ SD not mounted");
-        return;
+        Serial.println("❌ SD_MMC mount failed");
+        sd_ok = false;
+        return false;
     }
 
-#if defined(VST_BOARD_7070)
-    sd_stats_spi();
-#elif defined(VST_BOARD_7080)
-    sd_stats_sdmmc();
-#endif
+    uint64_t size = SD_MMC.cardSize();
+    uint64_t used = SD_MMC.usedBytes();
+
+    Serial.printf("✅ SD card mounted\n");
+    Serial.printf("📦 SD size : %llu MB\n", size / (1024 * 1024));
+    Serial.printf("📊 SD usage: %llu / %llu bytes\n", used, size);
+
+    sd_ok = true;
+    return true;
 }
+
+bool sdcard_available()
+{
+    return sd_ok;
+}
+
+bool sdcard_save_jpeg(uint32_t frame_id, const uint8_t *data, size_t len)
+{
+    if (!sd_ok) return false;
+
+    char ts[20] = {0};
+    char path[96];
+
+    if (time_valid && format_now_timestamp(ts, sizeof(ts)))
+        snprintf(path, sizeof(path), "/%s_frame_%06lu.jpg", ts, (unsigned long)frame_id);
+    else
+        snprintf(path, sizeof(path), "/frame_%06lu.jpg", (unsigned long)frame_id);
+
+    File f = SD_MMC.open(path, FILE_WRITE);
+    if (!f)
+    {
+        Serial.printf("❌ Failed to open %s\n", path);
+        return false;
+    }
+
+    size_t written = f.write(data, len);
+    f.close();
+
+    if (written != len)
+    {
+        Serial.printf("❌ SD write incomplete (%u / %u)\n", (unsigned)written, (unsigned)len);
+        return false;
+    }
+
+    Serial.printf("💾 JPEG saved: %s (%u bytes)\n", path, (unsigned)len);
+    return true;
+}
+
+#else
+#error "Define VST_BOARD_7070 or VST_BOARD_7080"
+#endif
