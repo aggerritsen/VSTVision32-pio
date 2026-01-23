@@ -1,0 +1,1 @@
+relative good torque in either direction with 400 speed
