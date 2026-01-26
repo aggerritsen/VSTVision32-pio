@@ -3,8 +3,14 @@
 #include <Seeed_Arduino_SSCMA.h>
 #include <esp_heap_caps.h>
 #include "esp_crc.h"
+#include "esp_timer.h"
 
 SSCMA AI;
+
+/* ================================
+   CONFIDENCE THRESHOLD
+   ================================ */
+static constexpr uint8_t CONFIDENCE_THRESHOLD = 70; // percent
 
 /* ================================
    UART CONFIG (XIAO → T-SIM)
@@ -21,16 +27,21 @@ static constexpr bool ENABLE_UART_TRANSPORT = true; // switch to enable/disable 
 /* ================================
    ACTUATORS
    ================================ */
-static constexpr int LED_PIN_1 = 1;   // D0, PIN 1, RED
+static constexpr int LED_PIN_1 = 1;   // D0, PIN 1, RED  (Grove LED / Relay)
 static constexpr int LED_PIN_2 = 2;   // D1, PIN 2, GREEN
 static constexpr int LED_PIN_3 = 3;   // D2, PIN 3, WHITE
 
 /* LED timing */
-static constexpr uint32_t LED_ON_MS = 1000;
+static constexpr uint32_t LED_ON_MS = 5000;
 
 static uint32_t led1_until = 0;
 static uint32_t led2_until = 0;
 static uint32_t led3_until = 0;
+
+/* Actuator timers (more responsive than relying on loop timing) */
+static esp_timer_handle_t led1_timer = nullptr;
+static esp_timer_handle_t led2_timer = nullptr;
+static esp_timer_handle_t led3_timer = nullptr;
 
 HardwareSerial BrokerUART(1);
 
@@ -38,6 +49,7 @@ HardwareSerial BrokerUART(1);
    TRANSPORT
    ================================ */
 static constexpr uint32_t ACK_TIMEOUT_MS = 5000;
+static constexpr uint8_t  MAX_ACK_TIMEOUT_RETRIES = 5;
 
 /* ================================
    STATE
@@ -46,12 +58,19 @@ static uint32_t frame_id = 0;
 static bool     awaiting_ack = false;
 static uint32_t last_send_ms = 0;
 
+/* timeout retry tracking + transport pause */
+static uint8_t ack_timeout_retries = 0;
+static bool    transport_paused = false;
+
 /* Cached frame (for resend) */
 static String cached_json;
 static String cached_inf;
 static String cached_image;
 static size_t cached_image_len = 0;
 static uint32_t cached_image_crc = 0;
+
+/* UART RX line assembly (non-blocking) */
+static String uart_line;
 
 /* ================================
    UTIL
@@ -67,11 +86,51 @@ void log_memory()
 }
 
 /* ================================
+   ACTUATOR TIMER CALLBACKS
+   ================================ */
+static void led1_off_cb(void *arg)
+{
+    (void)arg;
+    digitalWrite(LED_PIN_1, LOW);
+    led1_until = 0;
+}
+static void led2_off_cb(void *arg)
+{
+    (void)arg;
+    digitalWrite(LED_PIN_2, LOW);
+    led2_until = 0;
+}
+static void led3_off_cb(void *arg)
+{
+    (void)arg;
+    digitalWrite(LED_PIN_3, LOW);
+    led3_until = 0;
+}
+
+/* Trigger helper: immediate ON + scheduled OFF even if loop is busy */
+static inline void trigger_actuator(int pin, esp_timer_handle_t tmr, uint32_t &until_ms)
+{
+    digitalWrite(pin, HIGH);
+    uint32_t now = millis();
+    until_ms = now + LED_ON_MS;
+
+    if (tmr)
+    {
+        // restart one-shot
+        esp_timer_stop(tmr);
+        esp_timer_start_once(tmr, (uint64_t)LED_ON_MS * 1000ULL);
+    }
+}
+
+/* ================================
    SEND FRAME (CACHED)
    ================================ */
 void send_cached_frame()
 {
     if (!ENABLE_UART_TRANSPORT)
+        return;
+
+    if (transport_paused)
         return;
 
     BrokerUART.print("JSON ");
@@ -94,7 +153,7 @@ void send_cached_frame()
     Serial.printf(
         "📤 frame %lu sent (%u bytes)\n",
         frame_id,
-        cached_image_len
+        (unsigned)cached_image_len
     );
 }
 
@@ -108,16 +167,15 @@ bool prepare_frame()
         return false;
 
     Serial.println("🧠 RAW INFERENCE RESULT");
-    Serial.printf("boxes: %u\n", AI.boxes().size());
+    Serial.printf("boxes: %u\n", (unsigned)AI.boxes().size());
 
-    uint32_t now = millis();
-
+    // Actuation should be fast and not dependent on loop timing
     for (size_t i = 0; i < AI.boxes().size(); i++)
     {
         auto &b = AI.boxes()[i];
         Serial.printf(
             "  [%u] target=%u score=%u x=%u y=%u w=%u h=%u\n",
-            i,
+            (unsigned)i,
             b.target,
             b.score,
             b.x,
@@ -126,22 +184,19 @@ bool prepare_frame()
             b.h
         );
 
-        if (b.target == 3)
+        if (b.target == 3 && b.score >= CONFIDENCE_THRESHOLD)
         {
-            digitalWrite(LED_PIN_1, HIGH);
-            led1_until = now + LED_ON_MS;
+            trigger_actuator(LED_PIN_1, led1_timer, led1_until);
         }
-        else if (b.target == 2)
+        else if (b.target == 2 && b.score >= CONFIDENCE_THRESHOLD)
         {
-            digitalWrite(LED_PIN_2, HIGH);
-            led2_until = now + LED_ON_MS;
+            trigger_actuator(LED_PIN_2, led2_timer, led2_until);
         }
-        else if (b.target == 3)
+        else if (b.target == 3 && b.score >= CONFIDENCE_THRESHOLD)
         {
-            digitalWrite(LED_PIN_3, HIGH);
-            led3_until = now + LED_ON_MS;
+            trigger_actuator(LED_PIN_3, led3_timer, led3_until);
         }
-    }
+}
 
     frame_id++;
 
@@ -179,6 +234,22 @@ bool prepare_frame()
 
     cached_json = cached_inf;
 
+    // If UART transport is paused (timeouts), skip heavy image work entirely
+    // This makes inference + actuation remain responsive and avoids remote image reception load.
+    if (!ENABLE_UART_TRANSPORT || transport_paused)
+    {
+        cached_image = "";
+        cached_image_len = 0;
+        cached_image_crc = 0;
+
+        Serial.printf(
+            "🧠 prepared frame %lu (img=SKIPPED transport_paused=%s)\n",
+            frame_id,
+            transport_paused ? "YES" : "NO"
+        );
+        return true;
+    }
+
     cached_image = AI.last_image();
     cached_image_len = cached_image.length();
 
@@ -191,11 +262,75 @@ bool prepare_frame()
     Serial.printf(
         "🧠 prepared frame %lu (img=%u, crc=%08lx)\n",
         frame_id,
-        cached_image_len,
+        (unsigned)cached_image_len,
         cached_image_crc
     );
 
     return true;
+}
+
+/* ================================
+   UART RX LINE PROCESSING
+   ================================ */
+static void process_uart_line(const String &line)
+{
+    if (line.startsWith("ACK "))
+    {
+        uint32_t ack_id = line.substring(4).toInt();
+
+        // Any ACK can be treated as "link is alive again" if we were paused
+        if (transport_paused)
+        {
+            transport_paused = false;
+            ack_timeout_retries = 0;
+            awaiting_ack = false;
+            Serial.printf("🔓 transport resumed on ACK %lu\n", ack_id);
+        }
+
+        if (ack_id == frame_id)
+        {
+            awaiting_ack = false;
+            ack_timeout_retries = 0;
+            Serial.printf("✅ ACK %lu\n", ack_id);
+        }
+    }
+    else if (line.startsWith("NACK "))
+    {
+        uint32_t nack_id = line.substring(5).toInt();
+        if (nack_id == frame_id)
+        {
+            Serial.printf("🔁 NACK %lu → resend\n", nack_id);
+            send_cached_frame();
+        }
+    }
+}
+
+/* Non-blocking UART poll: assemble lines char-by-char */
+static void poll_uart_nonblocking()
+{
+    while (BrokerUART.available())
+    {
+        char c = (char)BrokerUART.read();
+
+        if (c == '\r')
+            continue;
+
+        if (c == '\n')
+        {
+            uart_line.trim();
+            if (uart_line.length() > 0)
+            {
+                process_uart_line(uart_line);
+            }
+            uart_line = "";
+        }
+        else
+        {
+            // prevent runaway memory usage if peer sends junk without newlines
+            if (uart_line.length() < 200)
+                uart_line += c;
+        }
+    }
 }
 
 /* ================================
@@ -207,10 +342,28 @@ void setup()
     pinMode(LED_PIN_2, OUTPUT);
     pinMode(LED_PIN_3, OUTPUT);
 
-    uint32_t now = millis();
-    digitalWrite(LED_PIN_1, HIGH); led1_until = now + LED_ON_MS;
-    digitalWrite(LED_PIN_2, HIGH); led2_until = now + LED_ON_MS;
-    digitalWrite(LED_PIN_3, HIGH); led3_until = now + LED_ON_MS;
+    // Create timers (one-shot)
+    {
+        esp_timer_create_args_t a1 = {};
+        a1.callback = &led1_off_cb;
+        a1.name = "led1_off";
+        esp_timer_create(&a1, &led1_timer);
+
+        esp_timer_create_args_t a2 = {};
+        a2.callback = &led2_off_cb;
+        a2.name = "led2_off";
+        esp_timer_create(&a2, &led2_timer);
+
+        esp_timer_create_args_t a3 = {};
+        a3.callback = &led3_off_cb;
+        a3.name = "led3_off";
+        esp_timer_create(&a3, &led3_timer);
+    }
+
+    // Power-on blink (still works, now via trigger helper)
+    trigger_actuator(LED_PIN_1, led1_timer, led1_until);
+    trigger_actuator(LED_PIN_2, led2_timer, led2_until);
+    trigger_actuator(LED_PIN_3, led3_timer, led3_until);
 
     Serial.begin(115200);
     delay(500);
@@ -247,53 +400,50 @@ void setup()
    ================================ */
 void loop()
 {
-    uint32_t now = millis();
-
-    if (led1_until && now > led1_until) { digitalWrite(LED_PIN_1, LOW); led1_until = 0; }
-    if (led2_until && now > led2_until) { digitalWrite(LED_PIN_2, LOW); led2_until = 0; }
-    if (led3_until && now > led3_until) { digitalWrite(LED_PIN_3, LOW); led3_until = 0; }
-
+    // UART RX (non-blocking)
     if (ENABLE_UART_TRANSPORT)
     {
-        while (BrokerUART.available())
-        {
-            String line = BrokerUART.readStringUntil('\n');
-            line.trim();
+        poll_uart_nonblocking();
 
-            if (line.startsWith("ACK "))
-            {
-                uint32_t ack_id = line.substring(4).toInt();
-                if (ack_id == frame_id)
-                {
-                    awaiting_ack = false;
-                    Serial.printf("✅ ACK %lu\n", ack_id);
-                }
-            }
-            else if (line.startsWith("NACK "))
-            {
-                uint32_t nack_id = line.substring(5).toInt();
-                if (nack_id == frame_id)
-                {
-                    Serial.printf("🔁 NACK %lu → resend\n", nack_id);
-                    send_cached_frame();
-                }
-            }
-        }
-
-        if (awaiting_ack && millis() - last_send_ms > ACK_TIMEOUT_MS)
+        // ACK timeout / resend / pause logic
+        if (awaiting_ack && (millis() - last_send_ms > ACK_TIMEOUT_MS))
         {
-            Serial.printf("⏱ ACK timeout for frame %lu → resend\n", frame_id);
+            ack_timeout_retries++;
+
+            if (ack_timeout_retries >= MAX_ACK_TIMEOUT_RETRIES)
+            {
+                Serial.printf(
+                    "⏱ ACK timeout x%u for frame %lu → STOP SENDING, keep inference running (skip images)\n",
+                    ack_timeout_retries,
+                    frame_id
+                );
+
+                transport_paused = true;
+                awaiting_ack = false;
+                return;
+            }
+
+            Serial.printf(
+                "⏱ ACK timeout for frame %lu (retry %u/%u) → resend\n",
+                frame_id,
+                ack_timeout_retries,
+                MAX_ACK_TIMEOUT_RETRIES
+            );
             send_cached_frame();
             return;
         }
     }
 
+    // Prepare new frame only when we are not waiting on ACK
     if (!awaiting_ack)
     {
         if (prepare_frame())
         {
             if (ENABLE_UART_TRANSPORT)
+            {
+                // send_cached_frame() will no-op if transport_paused==true
                 send_cached_frame();
+            }
         }
     }
 }
