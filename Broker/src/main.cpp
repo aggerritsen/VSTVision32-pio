@@ -5,6 +5,23 @@
 #include "esp_crc.h"
 #include "esp_timer.h"
 
+/* ================================
+   OLED (XIAO Expansion Board)
+   ================================ */
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+static constexpr uint8_t OLED_ADDR = 0x3C;
+static constexpr int OLED_W = 128;
+static constexpr int OLED_H = 64;
+
+Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
+static bool OLED_OK = false;
+
+static uint8_t  oled_last_target = 255;
+static uint8_t  oled_last_score  = 255;
+static uint32_t oled_last_ms     = 0;
+
 SSCMA AI;
 
 /* ================================
@@ -32,7 +49,7 @@ static constexpr int LED_PIN_2 = 2;   // D1, PIN 2, GREEN
 static constexpr int LED_PIN_3 = 3;   // D2, PIN 3, WHITE
 
 /* LED timing */
-static constexpr uint32_t LED_ON_MS = 5000;
+static constexpr uint32_t LED_ON_MS = 2000;
 
 static uint32_t led1_until = 0;
 static uint32_t led2_until = 0;
@@ -85,6 +102,92 @@ void log_memory()
     );
 }
 
+static const char* target_to_label(uint8_t target)
+{
+    switch (target)
+    {
+        case 3: return "Vespa velutina";
+        case 1: return "Vespa crabro";
+        case 0: return "Apis mellifera";
+        default: return "Unknown";
+    }
+}
+
+/* ================================
+   OLED DRAW
+   ================================ */
+static void oled_show(uint8_t target, uint8_t score)
+{
+    if (!OLED_OK) return;
+
+    // Avoid excessive redraws (OLED + I2C) if nothing changes.
+    // Still allow occasional refresh.
+    uint32_t now = millis();
+    bool changed = (target != oled_last_target) || (score != oled_last_score);
+    bool stale = (now - oled_last_ms) > 1000;
+
+    if (!changed && !stale) return;
+
+    oled_last_target = target;
+    oled_last_score  = score;
+    oled_last_ms     = now;
+
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+
+    // Big confidence caption (top)
+    // Format: "86%"
+    display.setTextSize(3);
+    display.setCursor(0, 0);
+    display.printf("%u%%", (unsigned)score);
+
+    // Species label below
+    display.setTextSize(1);
+    display.setCursor(0, 34);
+    display.println(target_to_label(target));
+
+    // Optional small status line (keeps main request intact, but helpful)
+    display.setCursor(0, 52);
+    display.print("thr ");
+    display.print(CONFIDENCE_THRESHOLD);
+    display.print("% ");
+    display.print(transport_paused ? "UART PAUSE" : "UART OK");
+
+    display.display();
+}
+
+static void oled_show_no_detection()
+{
+    if (!OLED_OK) return;
+
+    uint32_t now = millis();
+    bool stale = (now - oled_last_ms) > 1000;
+    if (!stale) return;
+
+    oled_last_target = 255;
+    oled_last_score  = 255;
+    oled_last_ms     = now;
+
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.println("--");
+
+    display.setTextSize(1);
+    display.setCursor(0, 30);
+    display.println("No detection");
+
+    display.setCursor(0, 52);
+    display.print("thr ");
+    display.print(CONFIDENCE_THRESHOLD);
+    display.print("% ");
+    display.print(transport_paused ? "UART PAUSE" : "UART OK");
+
+    display.display();
+}
+
 /* ================================
    ACTUATOR TIMER CALLBACKS
    ================================ */
@@ -116,7 +219,6 @@ static inline void trigger_actuator(int pin, esp_timer_handle_t tmr, uint32_t &u
 
     if (tmr)
     {
-        // restart one-shot
         esp_timer_stop(tmr);
         esp_timer_start_once(tmr, (uint64_t)LED_ON_MS * 1000ULL);
     }
@@ -169,7 +271,11 @@ bool prepare_frame()
     Serial.println("🧠 RAW INFERENCE RESULT");
     Serial.printf("boxes: %u\n", (unsigned)AI.boxes().size());
 
-    // Actuation should be fast and not dependent on loop timing
+    // Pick "best" box for OLED (highest score)
+    uint8_t best_target = 0;
+    uint8_t best_score  = 0;
+    bool    have_best   = false;
+
     for (size_t i = 0; i < AI.boxes().size(); i++)
     {
         auto &b = AI.boxes()[i];
@@ -184,6 +290,15 @@ bool prepare_frame()
             b.h
         );
 
+        // Update "best" for OLED
+        if (!have_best || b.score > best_score)
+        {
+            have_best = true;
+            best_score = b.score;
+            best_target = b.target;
+        }
+
+        // Actuation (thresholded)
         if (b.target == 3 && b.score >= CONFIDENCE_THRESHOLD)
         {
             trigger_actuator(LED_PIN_1, led1_timer, led1_until);
@@ -196,7 +311,13 @@ bool prepare_frame()
         {
             trigger_actuator(LED_PIN_3, led3_timer, led3_until);
         }
-}
+    }
+
+    // OLED update
+    if (have_best)
+        oled_show(best_target, best_score);
+    else
+        oled_show_no_detection();
 
     frame_id++;
 
@@ -235,7 +356,6 @@ bool prepare_frame()
     cached_json = cached_inf;
 
     // If UART transport is paused (timeouts), skip heavy image work entirely
-    // This makes inference + actuation remain responsive and avoids remote image reception load.
     if (!ENABLE_UART_TRANSPORT || transport_paused)
     {
         cached_image = "";
@@ -360,11 +480,6 @@ void setup()
         esp_timer_create(&a3, &led3_timer);
     }
 
-    // Power-on blink (still works, now via trigger helper)
-    trigger_actuator(LED_PIN_1, led1_timer, led1_until);
-    trigger_actuator(LED_PIN_2, led2_timer, led2_until);
-    trigger_actuator(LED_PIN_3, led3_timer, led3_until);
-
     Serial.begin(115200);
     delay(500);
 
@@ -385,6 +500,27 @@ void setup()
     Wire.begin();
     Wire.setClock(400000);
 
+    // OLED init (do NOT hard-fail if missing)
+    if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
+    {
+        OLED_OK = true;
+        display.clearDisplay();
+        display.setTextColor(SSD1306_WHITE);
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("OLED OK");
+        display.print("thr ");
+        display.print(CONFIDENCE_THRESHOLD);
+        display.println("%");
+        display.display();
+        Serial.println("✅ OLED initialized");
+    }
+    else
+    {
+        OLED_OK = false;
+        Serial.println("⚠️ OLED init failed (continuing without OLED)");
+    }
+
     if (!AI.begin(&Wire))
     {
         Serial.println("❌ SSCMA init failed");
@@ -393,6 +529,11 @@ void setup()
 
     Serial.println("✅ SSCMA initialized");
     log_memory();
+
+    // Power-on blink (still works, now via trigger helper)
+    trigger_actuator(LED_PIN_1, led1_timer, led1_until);
+    trigger_actuator(LED_PIN_2, led2_timer, led2_until);
+    trigger_actuator(LED_PIN_3, led3_timer, led3_until);
 }
 
 /* ================================
